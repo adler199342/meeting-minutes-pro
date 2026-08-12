@@ -1,0 +1,7 @@
+interface:
+  display_name: "专业会议纪要"
+  short_description: "生成一页式总结、HTML 与可编辑 Word 会议纪要"
+  default_prompt: "使用 $meeting-minutes-pro 将这份会议记录整理成 HTML 和 Word 会议纪要。"
+
+policy:
+  allow_implicit_invocation: true
