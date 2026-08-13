@@ -40,6 +40,10 @@ python3 scripts/generate_minutes.py meeting-data.json --output-dir output
 
 生成自包含 HTML、无光标标记的总结 PNG 和 DOCX。HTML 与 Word 必须来自同一 JSON。
 
+生成器使用单次 `officecli batch --stop-on-error` 写入 Word，并在 batch 后强制 `close` 落盘。DOCX 先写入唯一临时文件，完成 ZIP、正文段落、总结图片和待办表格回读校验后才原子替换最终文件；首次失败会自动清理并重试一次，重试失败必须显式报错，不得交付空文档。
+
+服务端可用 `MEETING_DOCX_CJK_FONT` 指定已安装的中文字体，例如 `Noto Sans CJK SC`；未指定时使用 `Microsoft YaHei`。
+
 ### 4. 验收
 
 HTML：使用 agent-browser 在 1440px 与 390px 宽度检查页面，确认无横向溢出、遮挡、控制台错误或点击标记。
@@ -57,5 +61,6 @@ Word：使用 documents 技能的 `render_docx.py` 渲染全部页面，逐页�
 - 不默认使用时间线；使用与会议类型匹配的决策路径。
 - 正文有结论、有证据、有管理含义，且保留真实分歧。
 - Word 第 1 页横向总结，第 2 页起竖向可编辑正文。
+- Word 必须通过生成器结构回读；不得以“文件存在”或命令返回 0 作为成功标准。
 - 所有关键数字、决策和待办在 HTML 与 Word 中一致。
 - 最终文件不得包含占位符、自动化点击标记、工具日志或内部分析。
