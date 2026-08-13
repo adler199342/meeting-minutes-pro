@@ -6,10 +6,14 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
 import subprocess
 import sys
+import uuid
+import zipfile
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 try:
     from validate_meeting_data import load_data, validate
@@ -38,6 +42,11 @@ def safe_filename(value: str) -> str:
 
 def slug(index: int) -> str:
     return f"topic-{index}"
+
+
+def choose_cjk_font() -> str:
+    """Allow the service to pin its installed CJK font."""
+    return os.environ.get("MEETING_DOCX_CJK_FONT", "Microsoft YaHei").strip() or "Microsoft YaHei"
 
 
 def adapt_v1(data: dict) -> dict:
@@ -180,8 +189,8 @@ def build_html(data: dict) -> str:
     return template.replace("__DOCUMENT_TITLE__", esc(f"{data['title']} - 会议纪要")).replace("__INLINE_STYLE__", css).replace("__DOCUMENT_BODY__", render_summary(data) + render_details(data))
 
 
-def run(command: list[str], *, capture: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(command, check=True, capture_output=capture, text=True)
+def run(command: list[str], *, capture: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(command, check=True, capture_output=capture, text=True, env=env)
 
 
 def capture_summary(html_path: Path, png_path: Path) -> None:
@@ -207,79 +216,174 @@ def capture_summary(html_path: Path, png_path: Path) -> None:
         raise RuntimeError(f"总结截图失败：{getattr(exc, 'stderr', '') or exc}") from exc
 
 
-def office(file: Path, args: list[str]) -> None:
+def office(file: Path, args: list[str]) -> subprocess.CompletedProcess:
     try:
-        run(["officecli"] + args)
+        return run(["officecli"] + args)
     except (FileNotFoundError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(f"Word 生成失败：{getattr(exc, 'stderr', '') or exc}") from exc
 
 
-def add_p(file: Path, value: str = "", **props) -> None:
-    args = ["add", str(file), "/body", "--type", "paragraph"]
-    combined = {"text": value, **props}
-    for key, val in combined.items():
-        if val is not None and val != "":
-            args += ["--prop", f"{key}={val}"]
-    office(file, args)
+def add_command(commands: list[dict], command: str, *, parent: str | None = None,
+                path: str | None = None, element_type: str | None = None, **props) -> None:
+    item: dict = {"command": command}
+    if parent is not None:
+        item["parent"] = parent
+    if path is not None:
+        item["path"] = path
+    if element_type is not None:
+        item["type"] = element_type
+    clean = {key: value for key, value in props.items() if value is not None and value != ""}
+    if clean:
+        item["props"] = clean
+    commands.append(item)
 
 
-def build_docx(data: dict, summary_png: Path, output: Path) -> None:
-    if output.exists(): output.unlink()
+def add_p(commands: list[dict], value: str = "", **props) -> None:
+    add_command(commands, "add", parent="/body", element_type="paragraph", text=value, **props)
+
+
+def run_office_batch(file: Path, commands: list[dict], work_dir: Path) -> None:
+    """Execute all document mutations in one open/save cycle and fail loudly."""
+    batch_file = work_dir / f"officecli-{uuid.uuid4().hex}.json"
+    batch_file.write_text(json.dumps(commands, ensure_ascii=False), encoding="utf-8")
+    env = os.environ.copy()
+    # A live resident may otherwise defer disk writes for several seconds.
+    env["OFFICECLI_RESIDENT_FLUSH"] = "each"
+    try:
+        result = run(
+            ["officecli", "batch", str(file), "--input", str(batch_file), "--stop-on-error", "--json"],
+            env=env,
+        )
+        try:
+            report = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Word 批处理返回了无法解析的结果：{result.stdout[-500:]}") from exc
+        summary = report.get("data", {}).get("summary", {})
+        if not report.get("success") or summary.get("failed", 0):
+            raise RuntimeError(f"Word 批处理失败：{json.dumps(report, ensure_ascii=False)[-1200:]}")
+        # Batch may run through a resident process. Explicit close is the disk
+        # durability barrier before a non-officecli reader inspects the DOCX.
+        run(["officecli", "close", str(file), "--json"], env=env)
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        detail = getattr(exc, "stderr", "") or getattr(exc, "stdout", "") or str(exc)
+        raise RuntimeError(f"Word 批处理失败：{detail[-1200:]}") from exc
+    finally:
+        batch_file.unlink(missing_ok=True)
+
+
+def validate_docx(file: Path, data: dict) -> dict[str, int]:
+    """Read the DOCX back from disk; an unverified file must never be published."""
+    if not file.is_file() or file.stat().st_size == 0:
+        raise RuntimeError("Word 自检失败：文件不存在或大小为 0")
+    try:
+        with zipfile.ZipFile(file) as archive:
+            bad_member = archive.testzip()
+            if bad_member:
+                raise RuntimeError(f"Word 自检失败：压缩成员损坏 {bad_member}")
+            names = set(archive.namelist())
+            required = {"[Content_Types].xml", "word/document.xml"}
+            if missing := required - names:
+                raise RuntimeError(f"Word 自检失败：缺少 {', '.join(sorted(missing))}")
+            root = ET.fromstring(archive.read("word/document.xml"))
+            ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            paragraphs = root.findall(".//w:p", ns)
+            tables = root.findall(".//w:tbl", ns)
+            body_text = "".join(node.text or "" for node in root.findall(".//w:t", ns))
+            # officecli versions differ: some store media at word/media/*,
+            # while 1.0.131 may serialize it at package-root media/*.
+            media = [name for name in names if name.startswith(("word/media/", "media/"))]
+    except (zipfile.BadZipFile, ET.ParseError, OSError) as exc:
+        raise RuntimeError(f"Word 自检失败：无法读取 DOCX 结构：{exc}") from exc
+
+    if len(paragraphs) < 8 or "详细会议纪要" not in body_text:
+        raise RuntimeError(f"Word 自检失败：正文不完整（段落 {len(paragraphs)}）")
+    # Office may serialize a picture as DrawingML or legacy VML; the embedded
+    # media part is the format-independent durability check.
+    if not media:
+        raise RuntimeError("Word 自检失败：总结首页图片未写入")
+    if data.get("action_items") and not tables:
+        raise RuntimeError("Word 自检失败：存在待办数据但未写入表格")
+    return {"paragraphs": len(paragraphs), "tables": len(tables), "images": len(media)}
+
+
+def build_docx_once(data: dict, summary_png: Path, output: Path, work_dir: Path) -> dict[str, int]:
+    output.unlink(missing_ok=True)
     office(output, ["create", str(output)])
-    office(output, ["set", str(output), "/styles/Normal", "--prop", "size=10.5pt", "--prop", "font.ea=Microsoft YaHei", "--prop", "font.latin=Microsoft YaHei", "--prop", "color=343A46", "--prop", "spaceAfter=6pt", "--prop", "lineSpacing=1.2x"])
+    commands: list[dict] = []
+    cjk_font = choose_cjk_font()
+    add_command(commands, "set", path="/styles/Normal", size="10.5pt", **{"font.ea": cjk_font, "font.latin": "Arial"}, color="343A46", spaceAfter="6pt", lineSpacing="1.2x")
     for sid, name, size, color, before, after in (("Heading1","Heading 1","18pt","1D477B","16pt","8pt"),("Heading2","Heading 2","14pt","285A92","14pt","7pt"),("Heading3","Heading 3","11.5pt","203858","10pt","4pt")):
-        office(output, ["add", str(output), "/styles", "--type", "style", "--prop", f"id={sid}", "--prop", f"name={name}", "--prop", "type=paragraph", "--prop", "basedOn=Normal", "--prop", f"size={size}", "--prop", "bold=true", "--prop", f"color={color}", "--prop", f"spaceBefore={before}", "--prop", f"spaceAfter={after}", "--prop", "keepNext=true", "--prop", "font.ea=Microsoft YaHei", "--prop", "font.latin=Microsoft YaHei"])
+        add_command(commands, "add", parent="/styles", element_type="style", id=sid, name=name, type="paragraph", basedOn="Normal", size=size, bold="true", color=color, spaceBefore=before, spaceAfter=after, keepNext="true", **{"font.ea": cjk_font, "font.latin": "Arial"})
     # Final section is portrait; the inserted section break closes the landscape summary section.
-    office(output, ["set", str(output), "/", "--prop", "pageWidth=21cm", "--prop", "pageHeight=29.7cm", "--prop", "orientation=portrait", "--prop", "marginTop=2.1cm", "--prop", "marginBottom=2.1cm", "--prop", "marginLeft=2.1cm", "--prop", "marginRight=2.1cm", "--prop", "marginHeader=1cm", "--prop", "marginFooter=1cm"])
-    add_p(output, align="center", spaceAfter="0pt")
+    add_command(commands, "set", path="/", pageWidth="21cm", pageHeight="29.7cm", orientation="portrait", marginTop="2.1cm", marginBottom="2.1cm", marginLeft="2.1cm", marginRight="2.1cm", marginHeader="1cm", marginFooter="1cm")
+    add_p(commands, align="center", spaceAfter="0pt")
     # Keep the raster summary fully inside the A4 landscape printable area.
-    office(output, ["add", str(output), "/body/p[1]", "--type", "picture", "--prop", f"path={summary_png.resolve()}", "--prop", "width=9.85in"])
-    office(output, ["add", str(output), "/body", "--type", "section", "--prop", "type=nextPage", "--prop", "pageWidth=29.7cm", "--prop", "pageHeight=21cm", "--prop", "orientation=landscape", "--prop", "marginTop=1.3cm", "--prop", "marginBottom=1.3cm", "--prop", "marginLeft=1.3cm", "--prop", "marginRight=1.3cm"])
-    add_p(output, "详细会议纪要", style="Heading1")
+    add_command(commands, "add", parent="/body/p[1]", element_type="picture", src=str(summary_png.resolve()), width="9.85in")
+    add_command(commands, "add", parent="/body", element_type="section", type="nextPage", pageWidth="29.7cm", pageHeight="21cm", orientation="landscape", marginTop="1.3cm", marginBottom="1.3cm", marginLeft="1.3cm", marginRight="1.3cm")
+    add_p(commands, "详细会议纪要", style="Heading1")
     meta = "  |  ".join([f"日期：{data.get('date','未明确')}", f"类型：{data.get('meeting_type','未明确')}", f"时长：{data.get('duration','未明确')}", "参与人：" + "、".join(data.get("participants", []))])
-    add_p(output, meta, color="6F7784", size="9pt", spaceAfter="12pt")
-    add_p(output, "会议定调", style="Heading2")
-    add_p(output, data.get("executive_summary", ""), bold="true", fill="EDF4FF", leftIndent="0.25in", rightIndent="0.25in", spaceBefore="5pt", spaceAfter="10pt")
-    add_p(output, "会议背景与目标", style="Heading2")
-    add_p(output, text(data.get("background"), "原文未提供明确背景。"))
-    add_p(output, "会议内容", style="Heading2")
+    add_p(commands, meta, color="6F7784", size="9pt", spaceAfter="12pt")
+    add_p(commands, "会议定调", style="Heading2")
+    add_p(commands, data.get("executive_summary", ""), bold="true", fill="EDF4FF", leftIndent="0.25in", rightIndent="0.25in", spaceBefore="5pt", spaceAfter="10pt")
+    add_p(commands, "会议背景与目标", style="Heading2")
+    add_p(commands, text(data.get("background"), "原文未提供明确背景。"))
+    add_p(commands, "会议内容", style="Heading2")
     for index, topic in enumerate(data.get("topics", []), 1):
-        add_p(output, f"{index}. {topic.get('title','')}", style="Heading3")
-        add_p(output, topic.get("thesis", ""), bold="true", color="26364C", keepNext="true")
+        add_p(commands, f"{index}. {topic.get('title','')}", style="Heading3")
+        add_p(commands, topic.get("thesis", ""), bold="true", color="26364C", keepNext="true")
         for sub in topic.get("subsections", []):
-            add_p(output, sub.get("subtitle", ""), bold="true", color="4A5565", spaceBefore="6pt", spaceAfter="3pt", keepNext="true")
+            add_p(commands, sub.get("subtitle", ""), bold="true", color="4A5565", spaceBefore="6pt", spaceAfter="3pt", keepNext="true")
             for point in sub.get("points", []):
                 detail = point.get("claim", "")
                 if point.get("evidence"): detail += f"（依据：{point['evidence']}）"
-                add_p(output, detail, listStyle="bullet", leftIndent="0.42in", hangingIndent="0.2in", spaceAfter="4pt")
-        for value in topic.get("implications", []): add_p(output, f"管理含义：{value}", fill="EEF5FF", color="2E4E78", leftIndent="0.2in", rightIndent="0.2in")
-        for value in topic.get("open_questions", []): add_p(output, f"待确认：{value}", fill="FFF6E8", color="785019", leftIndent="0.2in", rightIndent="0.2in")
-    add_p(output, "明确决策", style="Heading2")
+                add_p(commands, detail, listStyle="bullet", leftIndent="0.42in", hangingIndent="0.2in", spaceAfter="4pt")
+        for value in topic.get("implications", []): add_p(commands, f"管理含义：{value}", fill="EEF5FF", color="2E4E78", leftIndent="0.2in", rightIndent="0.2in")
+        for value in topic.get("open_questions", []): add_p(commands, f"待确认：{value}", fill="FFF6E8", color="785019", leftIndent="0.2in", rightIndent="0.2in")
+    add_p(commands, "明确决策", style="Heading2")
     for item in data.get("key_decisions", []):
-        add_p(output, item.get("decision", ""), bold="true", fill="F4F8FF", keepNext="true")
-        add_p(output, f"依据：{text(item.get('rationale'))}；负责人：{text(item.get('owner'),'待指定')}；证据：{text(item.get('evidence'))}", color="6F7784", size="9pt", leftIndent="0.2in")
-    add_p(output, "会议分析", style="Heading2")
+        add_p(commands, item.get("decision", ""), bold="true", fill="F4F8FF", keepNext="true")
+        add_p(commands, f"依据：{text(item.get('rationale'))}；负责人：{text(item.get('owner'),'待指定')}；证据：{text(item.get('evidence'))}", color="6F7784", size="9pt", leftIndent="0.2in")
+    add_p(commands, "会议分析", style="Heading2")
     analysis = data.get("meeting_analysis", {})
     for title, values in (("逻辑主线",analysis.get("core_logic",[])),("管理含义",analysis.get("management_implications",[])),("主要风险",analysis.get("risks",[]))):
         if values:
-            add_p(output, title, bold="true", color="344A68", keepNext="true")
-            for value in values: add_p(output, value, listStyle="bullet", leftIndent="0.42in", hangingIndent="0.2in")
-    add_p(output, "待确认事项", style="Heading2")
-    for value in data.get("pending_items", []): add_p(output, value, listStyle="bullet", fill="FFF6E8", color="785019")
+            add_p(commands, title, bold="true", color="344A68", keepNext="true")
+            for value in values: add_p(commands, value, listStyle="bullet", leftIndent="0.42in", hangingIndent="0.2in")
+    add_p(commands, "待确认事项", style="Heading2")
+    for value in data.get("pending_items", []): add_p(commands, value, listStyle="bullet", fill="FFF6E8", color="785019")
     # A natural page break here prevents the action table from being stranded as
     # one or two rows on a mostly empty trailing page.
-    add_p(output, "完整待办", style="Heading2", pageBreakBefore="true")
+    add_p(commands, "完整待办", style="Heading2", pageBreakBefore="true")
     actions = data.get("action_items", [])
     if actions:
-        office(output, ["add", str(output), "/body", "--type", "table", "--prop", "colWidths=1050,3000,1250,2800,850", "--prop", "layout=fixed", "--prop", "border.all=single;0.6pt;B9C4D2"])
+        add_command(commands, "add", parent="/body", element_type="table", colWidths="1050,3000,1250,2800,850", layout="fixed", **{"border.all": "single;0.6pt;B9C4D2"})
         headers=("责任人","行动项","截止日期","验收标准","优先级")
-        for i,label in enumerate(headers,1): office(output,["set",str(output),f"/body/tbl[1]/tr[1]/tc[{i}]","--prop",f"text={label}","--prop","bold=true","--prop","fill=EAF0F7","--prop","align=center","--prop","valign=center"])
+        for i,label in enumerate(headers,1): add_command(commands, "set", path=f"/body/tbl[1]/tr[1]/tc[{i}]", text=label, bold="true", fill="EAF0F7", align="center", valign="center")
         for r,item in enumerate(actions,2):
-            office(output,["add",str(output),"/body/tbl[1]","--type","row"])
+            add_command(commands, "add", parent="/body/tbl[1]", element_type="row")
             vals=(text(item.get("owner"),"待指定"),text(item.get("action")),text(item.get("deadline")),text(item.get("acceptance_criteria")),text(item.get("priority"),"中"))
-            for c,value in enumerate(vals,1): office(output,["set",str(output),f"/body/tbl[1]/tr[{r}]/tc[{c}]","--prop",f"text={value}","--prop",f"align={'center' if c in (1,3,5) else 'left'}","--prop","valign=center","--prop","padding=0.08in"])
-    office(output, ["save", str(output)])
-    office(output, ["close", str(output)])
+            for c,value in enumerate(vals,1): add_command(commands, "set", path=f"/body/tbl[1]/tr[{r}]/tc[{c}]", text=value, align="center" if c in (1,3,5) else "left", valign="center", padding="0.08in")
+    run_office_batch(output, commands, work_dir)
+    return validate_docx(output, data)
+
+
+def build_docx(data: dict, summary_png: Path, output: Path, *, attempts: int = 2) -> dict[str, int]:
+    """Build in an isolated file, validate, then atomically publish the result."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    failures: list[str] = []
+    for attempt in range(1, attempts + 1):
+        temp_output = output.parent / f".{output.stem}.{uuid.uuid4().hex}.tmp.docx"
+        try:
+            stats = build_docx_once(data, summary_png, temp_output, output.parent)
+            os.replace(temp_output, output)
+            return stats
+        except Exception as exc:
+            failures.append(f"第 {attempt} 次：{exc}")
+            temp_output.unlink(missing_ok=True)
+            if attempt < attempts:
+                print(f"WARNING: Word 生成失败，准备重试：{exc}", file=sys.stderr)
+    output.unlink(missing_ok=True)
+    raise RuntimeError("Word 生成在重试后仍未通过自检：" + "；".join(failures))
 
 
 def main() -> int:
@@ -304,10 +408,11 @@ def main() -> int:
     html_path.write_text(build_html(data), encoding="utf-8")
     try:
         capture_summary(html_path, png_path)
-        build_docx(data, png_path, docx_path)
+        stats = build_docx(data, png_path, docx_path)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr); return 3
     print(f"HTML: {html_path.resolve()}\nDOCX: {docx_path.resolve()}\nBUILD: {png_path.resolve()}")
+    print(f"VERIFY: paragraphs={stats['paragraphs']} tables={stats['tables']} images={stats['images']}")
     return 0
 
 
