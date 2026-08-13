@@ -179,6 +179,15 @@ python3 scripts/validate_meeting_data.py meeting-data.json
 python3 scripts/generate_minutes.py meeting-data.json --output-dir output
 ```
 
+服务端可按实际安装字体指定 Word 中文字体：
+
+```bash
+MEETING_DOCX_CJK_FONT="Noto Sans CJK SC" \
+python3 scripts/generate_minutes.py meeting-data.json --output-dir output
+```
+
+Word 采用单次 Batch 写入、强制落盘、唯一临时文件、结构回读、原子发布和一次失败重试。只有检测到完整正文、总结图片，以及存在待办时对应的表格，最终 DOCX 才会发布；因此不会把首次生成的空文件当成成功结果交付。
+
 生成目录包含：
 
 ```text
@@ -242,4 +251,3 @@ meeting-minutes-pro/
 - 本项目不会自动把生成结果上传到外部文档平台或发送给其他人。
 
 欢迎通过 Issue 提交会议类型、版式、服务端兼容性或内容质量方面的反馈。
-
