@@ -224,6 +224,7 @@ meeting-minutes-pro/
 ├── assets/
 │   ├── meeting-template.html        # HTML 页面模板
 │   └── meeting-style.css            # 总结与正文视觉样式
+├── docs/images/                     # README 脱敏效果截图
 ├── references/
 │   ├── meeting-data-schema.md       # 统一会议数据结构
 │   ├── content-rules.md             # 内容识别和提炼规则
